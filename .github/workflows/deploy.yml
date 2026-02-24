@@ -1,26 +1,21 @@
-name: Full CI/CD for Multi-App EKS Deployment
+name: Build & Deploy to EKS
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
 
 env:
-  AWS_REGION: ap-south-1
-
-  # ECR repo names
-  ECR_REPO_MAIN: main-app
-  ECR_REPO_AWS: aws-app
-  ECR_REPO_AZURE: azure-app
-  ECR_REPO_GCP: gcp-app
+  AWS_REGION: eu-north-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+  IMAGES: "main aws azure gcp"
 
 jobs:
-
-  build_push:
+  build:
     name: Build & Push All Images
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout Repo
+    - name: Checkout Code
       uses: actions/checkout@v3
 
     - name: Configure AWS Credentials
@@ -28,60 +23,32 @@ jobs:
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
-
-    - name: Get AWS Account ID
-      id: aws
-      run: echo "ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
-
-    - name: Set ECR Registry
-      run: echo "ECR_REGISTRY=${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_ENV
+        aws-region: ${{ secrets.AWS_REGION }}
 
     - name: Login to ECR
-      uses: aws-actions/amazon-ecr-login@v2
-
-    # Auto-create ECR repos
-    - name: Create ECR Repositories
       run: |
-        aws ecr describe-repositories --repository-name $ECR_REPO_MAIN || \
-        aws ecr create-repository --repository-name $ECR_REPO_MAIN
-        
-        aws ecr describe-repositories --repository-name $ECR_REPO_AWS || \
-        aws ecr create-repository --repository-name $ECR_REPO_AWS
-        
-        aws ecr describe-repositories --repository-name $ECR_REPO_AZURE || \
-        aws ecr create-repository --repository-name $ECR_REPO_AZURE
-        
-        aws ecr describe-repositories --repository-name $ECR_REPO_GCP || \
-        aws ecr create-repository --repository-name $ECR_REPO_GCP
+        aws ecr get-login-password --region $AWS_REGION \
+        | docker login --username AWS --password-stdin $ECR_REGISTRY
 
-    # Build and push all images
-    - name: Build and Push MAIN Image
+    - name: Create ECR repositories if missing
       run: |
-        docker build -t $ECR_REGISTRY/$ECR_REPO_MAIN:latest .
-        docker push $ECR_REGISTRY/$ECR_REPO_MAIN:latest
+        for img in $IMAGES; do
+          aws ecr describe-repositories --repository-names $img --region $AWS_REGION || \
+          aws ecr create-repository --repository-name $img --region $AWS_REGION
+        done
 
-    - name: Build and Push AWS Image
+    - name: Build & Push Docker Images
       run: |
-        docker build -t $ECR_REGISTRY/$ECR_REPO_AWS:latest ./aws
-        docker push $ECR_REGISTRY/$ECR_REPO_AWS:latest
-
-    - name: Build and Push AZURE Image
-      run: |
-        docker build -t $ECR_REGISTRY/$ECR_REPO_AZURE:latest ./azure
-        docker push $ECR_REGISTRY/$ECR_REPO_AZURE:latest
-
-    - name: Build and Push GCP Image
-      run: |
-        docker build -t $ECR_REGISTRY/$ECR_REPO_GCP:latest ./gcp
-        docker push $ECR_REGISTRY/$ECR_REPO_GCP:latest
-
-
+        for img in $IMAGES; do
+          echo "Building $img"
+          docker build -t $ECR_REGISTRY/$img:latest $img/
+          docker push $ECR_REGISTRY/$img:latest
+        done
 
   deploy:
     name: Deploy to EKS
-    needs: build_push
     runs-on: ubuntu-latest
+    needs: build
 
     steps:
     - name: Checkout Repo
@@ -92,31 +59,18 @@ jobs:
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+        aws-region: ${{ secrets.AWS_REGION }}
 
-    - name: Update Kubeconfig
+    - name: Update kubeconfig
       run: |
         aws eks update-kubeconfig --region $AWS_REGION --name amit
 
-    # Replace image names in YAML files
     - name: Update image names in Kubernetes YAML
       run: |
-        sed -i "s|IMAGE_MAIN|$ECR_REGISTRY/$ECR_REPO_MAIN:latest|g" k8s-files/main.yml
-        sed -i "s|IMAGE_AWS|$ECR_REGISTRY/$ECR_REPO_AWS:latest|g" k8s-files/aws.yml
-        sed -i "s|IMAGE_AZURE|$ECR_REGISTRY/$ECR_REPO_AZURE:latest|g" k8s-files/azure.yml
-        sed -i "s|IMAGE_GCP|$ECR_REGISTRY/$ECR_REPO_GCP:latest|g" k8s-files/gcp.yml
+        for img in $IMAGES; do
+          sed -i "s|IMAGE_$img|$ECR_REGISTRY/$img:latest|g" k8s-files/*.yml
+        done
 
-    - name: Deploy All Kubernetes Files
+    - name: Deploy all Kubernetes files
       run: |
-        kubectl apply -f k8s-files/main.yml
-        kubectl apply -f k8s-files/aws.yml
-        kubectl apply -f k8s-files/azure.yml
-        kubectl apply -f k8s-files/gcp.yml
-        kubectl apply -f k8s-files/ingress.yml
-
-        echo "------------ PODS ---------------"
-        kubectl get pods -A
-        echo "------------ SERVICES -----------"
-        kubectl get svc -A
-        echo "------------ INGRESS ------------"
-        kubectl get ingress -A
+        kubectl apply -f k8s-files/
